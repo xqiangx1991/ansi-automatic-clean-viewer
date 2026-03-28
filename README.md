@@ -132,3 +132,8 @@ Without these utilities, middle-click paste will include ANSI codes (default X11
 ## License
 
 MIT
+
+## Prebuilt VSIX
+
+- Repository includes a prebuilt package at `dist/ansi-automatic-clean-viewer-1.4.0.vsix`.
+- You can install it from VS Code: `Extensions` -> `...` -> `Install from VSIX...`
