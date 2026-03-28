@@ -1,11 +1,12 @@
 # ANSI Automatic Clean Viewer
 
-Automatically detects, hides ANSI escape codes and colorizes text in any text file with intelligent background processing and **full ANSI support**.
+Automatically detects and hides ANSI escape codes, colorizes text, and visually repairs common mojibake artifacts in any text file with intelligent background processing and **full ANSI support**.
 
 ## Features
 
 ### Core Features
 - **Smart ANSI Detection**: Automatically detects ANSI codes in any file type (.log, .txt, .ansi, etc.)
+- **Automatic Mojibake Repair**: Visually repairs common UTF-8 mis-decoding artifacts (progress bars, emoji, CJK text) without modifying files
 - **Full ANSI Support**:
   - ✨ 256 colors (codes 38;5;n and 48;5;n)
   - ✨ True color RGB (codes 38;2;r;g;b and 48;2;r;g;b)
@@ -54,6 +55,7 @@ Automatically detects, hides ANSI escape codes and colorizes text in any text fi
 ```json
 {
   "ansiCleanViewer.enabled": true,
+  "ansiCleanViewer.enableMojibakeRepair": true,
   "ansiCleanViewer.overrideCopyCommand": true,
   "ansiCleanViewer.enableMiddleClickPaste": true,
   "ansiCleanViewer.showAttributes": {
@@ -68,6 +70,7 @@ Automatically detects, hides ANSI escape codes and colorizes text in any text fi
 ### Configuration Options
 
 - **`enabled`**: Enable/disable automatic ANSI code hiding (default: `true`)
+- **`enableMojibakeRepair`**: Enable/disable visual mojibake repair rendering (default: `true`)
 - **`overrideCopyCommand`**: Override Ctrl+C/Cmd+C to copy without ANSI codes (default: `true`)
 - **`enableMiddleClickPaste`**: Enable automatic ANSI stripping for Linux middle-click paste (default: `true`)
 - **`showAttributes`**: Control which ANSI text attributes to display:

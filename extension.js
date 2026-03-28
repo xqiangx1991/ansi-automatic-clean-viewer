@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 
 let hideDecorationType = null;
+let replaceDecorationType = null;
 let colorDecorationTypes = new Map();
 let backgroundProcessing = new Map(); // Map<docUri, {currentLine, totalLines, intervalId}>
 let allDecorations = new Map(); // Map<docUri, {hiddenRanges, coloredRanges}>
@@ -46,6 +47,171 @@ const ANSI_256_COLORS = (() => {
 const VIEWPORT_BUFFER = 500; // Lines before/after viewport for preloading
 const CHUNK_SIZE = 1000; // Lines to process per background chunk
 const ANSI_DETECTION_LINES = 50; // Number of lines to check for ANSI codes initially
+const MOJIBAKE_TOKEN_REGEX = /[ÃÂÅâðËï�][^ \t\r\n]{0,240}/g;
+const MOJIBAKE_MARKER_REGEX = /[ÃÂÅâðË]|ï¿½|�/g;
+const MOJIBAKE_MARKER_TEST_REGEX = /[ÃÂÅâðË]|ï¿½|�/;
+const CP1252_ARTIFACT_TEST_REGEX = /[ŒœŠšŽžŸƒ…†‡‰‹›€™“”•–—˜]/g;
+const CP1252_UNICODE_TO_BYTE = new Map([
+    [0x20ac, 0x80], [0x201a, 0x82], [0x0192, 0x83], [0x201e, 0x84], [0x2026, 0x85],
+    [0x2020, 0x86], [0x2021, 0x87], [0x02c6, 0x88], [0x2030, 0x89], [0x0160, 0x8a],
+    [0x2039, 0x8b], [0x0152, 0x8c], [0x017d, 0x8e], [0x2018, 0x91], [0x2019, 0x92],
+    [0x201c, 0x93], [0x201d, 0x94], [0x2022, 0x95], [0x2013, 0x96], [0x2014, 0x97],
+    [0x02dc, 0x98], [0x2122, 0x99], [0x0161, 0x9a], [0x203a, 0x9b], [0x0153, 0x9c],
+    [0x017e, 0x9e], [0x0178, 0x9f]
+]);
+
+function mojibakeScore(value) {
+    const markerScore = (value.match(MOJIBAKE_MARKER_REGEX) || []).length * 3;
+    const badPairScore = (value.match(/(?:Ã.|Â.|â.|ð.|Å.|Ë.)/g) || []).length * 2;
+    return markerScore + badPairScore;
+}
+
+function artifactScore(value) {
+    let score = 0;
+    score += (value.match(CP1252_ARTIFACT_TEST_REGEX) || []).length * 4;
+
+    for (const ch of value) {
+        const cp = ch.codePointAt(0);
+        if (cp === 0xfffd) {
+            score += 10;
+            continue;
+        }
+        if (cp < 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) {
+            score += 10;
+            continue;
+        }
+        if (cp >= 0x00c0 && cp <= 0x00ff) {
+            score += 1;
+        }
+    }
+    return score;
+}
+
+function cjkScore(value) {
+    let score = 0;
+    for (const ch of value) {
+        const cp = ch.codePointAt(0);
+        if ((cp >= 0x3400 && cp <= 0x9fff) || (cp >= 0xf900 && cp <= 0xfaff)) {
+            score += 1;
+        }
+    }
+    return score;
+}
+
+function qualityScore(value) {
+    return mojibakeScore(value) * 5 + artifactScore(value);
+}
+
+function hasHighCodePoint(value) {
+    for (const ch of value) {
+        if (ch.codePointAt(0) > 255) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function hasNonAscii(value) {
+    for (let i = 0; i < value.length; i++) {
+        if (value.charCodeAt(i) > 127) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function looksLikeMojibakeToken(token) {
+    if (!token || token.length < 4 || !hasNonAscii(token)) {
+        return false;
+    }
+    return MOJIBAKE_MARKER_TEST_REGEX.test(token) || /(?:Ã.|Â.|â.|ð.|Å.|Ë.)/.test(token);
+}
+
+function encodeWindows1252(input) {
+    const bytes = [];
+    for (const ch of input) {
+        const cp = ch.codePointAt(0);
+        if (cp <= 0xff) {
+            bytes.push(cp);
+            continue;
+        }
+        const b = CP1252_UNICODE_TO_BYTE.get(cp);
+        if (b === undefined) {
+            return null;
+        }
+        bytes.push(b);
+    }
+    return Buffer.from(bytes);
+}
+
+function decodeUtf8FromSingleByteString(input) {
+    const buf = encodeWindows1252(input);
+    if (!buf) {
+        return null;
+    }
+    try {
+        return buf.toString('utf8');
+    } catch {
+        return null;
+    }
+}
+
+function decodeMojibakeToken(token) {
+    if (!looksLikeMojibakeToken(token)) {
+        return null;
+    }
+
+    let best = token;
+    let bestScore = qualityScore(token);
+    let bestCjk = cjkScore(token);
+    let current = token;
+
+    for (let i = 0; i < 2; i++) {
+        const decoded = decodeUtf8FromSingleByteString(current);
+        if (!decoded || decoded === current || decoded.includes('\u0000')) {
+            break;
+        }
+
+        const score = qualityScore(decoded);
+        const decodedCjk = cjkScore(decoded);
+        const betterScore = score < bestScore;
+        const betterCjk = score === bestScore && decodedCjk > bestCjk;
+        const betterGlyphs =
+            score === bestScore &&
+            decodedCjk === bestCjk &&
+            hasHighCodePoint(decoded) &&
+            !hasHighCodePoint(best);
+
+        if (betterScore || betterCjk || betterGlyphs) {
+            best = decoded;
+            bestScore = score;
+            bestCjk = decodedCjk;
+        }
+        current = decoded;
+    }
+
+    if (best === token) {
+        return null;
+    }
+    if (bestScore >= qualityScore(token) && !hasHighCodePoint(best)) {
+        return null;
+    }
+    return best;
+}
+
+function containsMojibakeTokens(document, startLine = 0, endLine = null) {
+    if (endLine === null) {
+        endLine = Math.min(startLine + ANSI_DETECTION_LINES - 1, document.lineCount - 1);
+    }
+
+    for (let i = startLine; i <= endLine; i++) {
+        const lineText = document.lineAt(i).text;
+        if (MOJIBAKE_MARKER_TEST_REGEX.test(lineText)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /**
  * Check if document contains ANSI escape codes in a specific range
@@ -129,6 +295,7 @@ function processRange(editor, startLine, endLine) {
 
     const hiddenRanges = [];
     const coloredRanges = new Map();
+    const replacementRanges = [];
 
     // Current text style state
     let state = {
@@ -192,7 +359,32 @@ function processRange(editor, startLine, endLine) {
         coloredRanges.get(key).push(colorRange);
     }
 
-    return { hiddenRanges, coloredRanges };
+    const config = vscode.workspace.getConfiguration('ansiCleanViewer');
+    const enableMojibakeRepair = config.get('enableMojibakeRepair', true);
+
+    if (enableMojibakeRepair) {
+        MOJIBAKE_TOKEN_REGEX.lastIndex = 0;
+        while ((match = MOJIBAKE_TOKEN_REGEX.exec(text)) !== null) {
+            const replacement = decodeMojibakeToken(match[0]);
+            if (!replacement) {
+                continue;
+            }
+
+            const absoluteStart = startOffset + match.index;
+            const absoluteEnd = startOffset + match.index + match[0].length;
+            const replaceStartPos = editor.document.positionAt(absoluteStart);
+            const replaceEndPos = editor.document.positionAt(absoluteEnd);
+
+            replacementRanges.push({
+                range: new vscode.Range(replaceStartPos, replaceEndPos),
+                renderOptions: {
+                    after: { contentText: replacement }
+                }
+            });
+        }
+    }
+
+    return { hiddenRanges, coloredRanges, replacementRanges };
 }
 
 /**
@@ -304,14 +496,15 @@ function parseAnsiCodes(codes, state) {
 /**
  * Add decorations to accumulated cache and apply all
  */
-function addAndApplyDecorations(editor, hiddenRanges, coloredRanges) {
+function addAndApplyDecorations(editor, hiddenRanges, coloredRanges, replacementRanges = []) {
     const docUri = editor.document.uri.toString();
 
     // Initialize cache for this document
     if (!allDecorations.has(docUri)) {
         allDecorations.set(docUri, {
             hiddenRanges: [],
-            coloredRanges: new Map()
+            coloredRanges: new Map(),
+            replacementRanges: []
         });
     }
 
@@ -319,6 +512,7 @@ function addAndApplyDecorations(editor, hiddenRanges, coloredRanges) {
 
     // Add new hidden ranges
     cache.hiddenRanges.push(...hiddenRanges);
+    cache.replacementRanges.push(...replacementRanges);
 
     // Add new colored ranges
     coloredRanges.forEach((ranges, key) => {
@@ -337,6 +531,13 @@ function addAndApplyDecorations(editor, hiddenRanges, coloredRanges) {
     }
 
     editor.setDecorations(hideDecorationType, cache.hiddenRanges);
+
+    if (!replaceDecorationType) {
+        replaceDecorationType = vscode.window.createTextEditorDecorationType({
+            textDecoration: 'none; font-size: 0;'
+        });
+    }
+    editor.setDecorations(replaceDecorationType, cache.replacementRanges);
 
     cache.coloredRanges.forEach((ranges, key) => {
         const [foreground, background, bold, italic, underline, strikethrough] = key.split('|');
@@ -409,8 +610,8 @@ function startBackgroundProcessing(editor) {
         }
 
         const endLine = Math.min(currentLine + CHUNK_SIZE - 1, totalLines - 1);
-        const { hiddenRanges, coloredRanges } = processRange(editor, currentLine, endLine);
-        addAndApplyDecorations(editor, hiddenRanges, coloredRanges);
+        const { hiddenRanges, coloredRanges, replacementRanges } = processRange(editor, currentLine, endLine);
+        addAndApplyDecorations(editor, hiddenRanges, coloredRanges, replacementRanges);
 
         console.log(`[ANSI CLEAN VIEWER] Background processed lines ${currentLine}-${endLine} (${Math.round((endLine / totalLines) * 100)}%)`);
 
@@ -467,8 +668,12 @@ function updateDecorations(editor) {
     const startLine = visibleRange.start.line;
     const endLine = Math.min(visibleRange.end.line, editor.document.lineCount - 1);
 
-    // Check if document contains ANSI codes in visible area (works for any file type)
-    if (!containsAnsiCodes(editor.document, startLine, endLine)) {
+    const hasAnsi = containsAnsiCodes(editor.document, startLine, endLine);
+    const enableMojibakeRepair = config.get('enableMojibakeRepair', true);
+    const hasMojibake = enableMojibakeRepair && containsMojibakeTokens(editor.document, startLine, endLine);
+
+    // Skip if neither ANSI codes nor mojibake artifacts are present.
+    if (!hasAnsi && !hasMojibake) {
         return;
     }
 
@@ -479,8 +684,8 @@ function updateDecorations(editor) {
         allDecorations.delete(docUri);
     }
 
-    const { hiddenRanges, coloredRanges } = processRange(editor, startLine, endLine);
-    addAndApplyDecorations(editor, hiddenRanges, coloredRanges);
+    const { hiddenRanges, coloredRanges, replacementRanges } = processRange(editor, startLine, endLine);
+    addAndApplyDecorations(editor, hiddenRanges, coloredRanges, replacementRanges);
 
     let totalColoredRanges = 0;
     coloredRanges.forEach(ranges => totalColoredRanges += ranges.length);
@@ -622,6 +827,10 @@ async function activate(context) {
                     hideDecorationType.dispose();
                     hideDecorationType = null;
                 }
+                if (replaceDecorationType) {
+                    replaceDecorationType.dispose();
+                    replaceDecorationType = null;
+                }
                 colorDecorationTypes.forEach(dt => dt.dispose());
                 colorDecorationTypes.clear();
             }
@@ -729,6 +938,9 @@ async function activate(context) {
             if (hideDecorationType) {
                 editor.setDecorations(hideDecorationType, []);
             }
+            if (replaceDecorationType) {
+                editor.setDecorations(replaceDecorationType, []);
+            }
             colorDecorationTypes.forEach(decorationType => {
                 editor.setDecorations(decorationType, []);
             });
@@ -751,6 +963,9 @@ async function activate(context) {
 function deactivate() {
     if (hideDecorationType) {
         hideDecorationType.dispose();
+    }
+    if (replaceDecorationType) {
+        replaceDecorationType.dispose();
     }
     colorDecorationTypes.forEach(dt => dt.dispose());
     colorDecorationTypes.clear();

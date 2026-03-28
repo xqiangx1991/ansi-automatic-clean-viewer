@@ -1,7 +1,7 @@
 {
   "name": "ansi-automatic-clean-viewer",
   "displayName": "ANSI Automatic Clean Viewer",
-  "description": "Full ANSI support (256 colors, RGB, italic, underline) with clean copy and configurable features",
+  "description": "Full ANSI support with automatic mojibake repair rendering, clean copy, and configurable features",
   "version": "1.4.0",
   "publisher": "eric-blanquer",
   "engines": {
@@ -68,6 +68,11 @@
           "type": "boolean",
           "default": true,
           "description": "Enable automatic ANSI code hiding"
+        },
+        "ansiCleanViewer.enableMojibakeRepair": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable visual repair of common mojibake text artifacts (for example progress-bar blocks, emoji, and CJK text)."
         },
         "ansiCleanViewer.overrideCopyCommand": {
           "type": "boolean",
